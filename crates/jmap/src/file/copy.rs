@@ -10,7 +10,7 @@ use crate::{
     changes::state::JmapCacheState,
     file::set::{
         Collision, NoResolver, fetch_existing_modified, find_sibling_collision, pick_unique_rename,
-        update_file_node, validate_file_node_hierarchy,
+        reserve_disk_quota, update_file_node, validate_file_node_hierarchy,
     },
 };
 use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
@@ -125,6 +125,11 @@ impl FileNodeCopy for Server {
             .on_destroy_remove_children
             .unwrap_or(false);
         let on_success_delete = request.on_success_destroy_original.unwrap_or(false);
+
+        // Copies are charged to the destination account. The request is committed
+        // as a single batch, so bytes admitted earlier in it are carried here.
+        let quota_account = self.account(account_id).await.caused_by(trc::location!())?;
+        let mut quota_reserved = 0u64;
 
         let mut batch = BatchBuilder::new();
         let mut pending_names: AHashMap<(u32, String), Option<u32>> = AHashMap::new();
@@ -366,6 +371,20 @@ impl FileNodeCopy for Server {
                     SetError::forbidden()
                         .with_description("Cannot create top-level folder in a shared account."),
                 );
+                continue 'create;
+            }
+
+            // Validate quota
+            if file_node.file.is_some()
+                && !reserve_disk_quota(
+                    self,
+                    &quota_account,
+                    &mut quota_reserved,
+                    file_node.size() as u64,
+                )
+                .await?
+            {
+                response.not_created.append(id, SetError::over_quota());
                 continue 'create;
             }
 

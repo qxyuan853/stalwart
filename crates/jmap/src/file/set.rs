@@ -9,7 +9,11 @@ use crate::{
     blob::download::BlobDownload,
     changes::state::JmapCacheState,
 };
-use common::{DavResourceMetadata, DavResources, Server, auth::AccessToken, sharing::EffectiveAcl};
+use common::{
+    DavResourceMetadata, DavResources, Server,
+    auth::{AccessToken, AccountCache},
+    sharing::EffectiveAcl,
+};
 use groupware::{DestroyArchive, cache::GroupwareCache, file::FileNode};
 use http_proto::HttpSessionData;
 use jmap_proto::{
@@ -83,6 +87,12 @@ impl FileNodeSet for Server {
             .unwrap_or(false);
         let mut pending_names: AHashMap<(u32, String), Option<u32>> = AHashMap::new();
         let mut implicit_destroys: AHashSet<u32> = AHashSet::new();
+
+        // The whole request is committed as a single batch, so the stored disk
+        // usage counter does not yet include nodes admitted earlier in this
+        // request. `quota_reserved` carries those bytes.
+        let quota_account = self.account(account_id).await.caused_by(trc::location!())?;
+        let mut quota_reserved = 0u64;
 
         // Process creates
         let mut batch = BatchBuilder::new();
@@ -266,6 +276,20 @@ impl FileNodeSet for Server {
                     );
                     continue 'create;
                 }
+            }
+
+            // Validate quota
+            if file_node.file.is_some()
+                && !reserve_disk_quota(
+                    self,
+                    &quota_account,
+                    &mut quota_reserved,
+                    file_node.size() as u64,
+                )
+                .await?
+            {
+                response.not_created.append(id, SetError::over_quota());
+                continue 'create;
             }
 
             // Validate ACLs
@@ -501,6 +525,18 @@ impl FileNodeSet for Server {
                     continue 'update;
                 }
             }
+
+            // Validate quota
+            let extra_bytes =
+                (new_file_node.size() as u64).saturating_sub(file_node.inner.size() as u64);
+            if new_file_node.file.is_some()
+                && !reserve_disk_quota(self, &quota_account, &mut quota_reserved, extra_bytes)
+                    .await?
+            {
+                response.not_updated.append(id, SetError::over_quota());
+                continue 'update;
+            }
+
             if has_acl_changes {
                 if let Err(err) = self.acl_validate(&new_file_node.acls).await {
                     response.not_updated.append(id, err.into());
@@ -643,6 +679,36 @@ impl FileNodeSet for Server {
         }
 
         Ok(response)
+    }
+}
+
+/// Admits `extra_bytes` against the account's disk quota (and its tenant's),
+/// on top of the `reserved` bytes already admitted earlier in the same request.
+/// Returns `Ok(false)` when the quota would be exceeded.
+pub(super) async fn reserve_disk_quota(
+    server: &Server,
+    account: &AccountCache,
+    reserved: &mut u64,
+    extra_bytes: u64,
+) -> trc::Result<bool> {
+    if extra_bytes == 0 {
+        return Ok(true);
+    }
+    match server
+        .has_available_quota(account, reserved.saturating_add(extra_bytes))
+        .await
+    {
+        Ok(()) => {
+            *reserved = reserved.saturating_add(extra_bytes);
+            Ok(true)
+        }
+        Err(err)
+            if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
+                || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota)) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err.caused_by(trc::location!())),
     }
 }
 
